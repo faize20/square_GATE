@@ -1,0 +1,127 @@
+import rospy
+import time
+import math
+from clover import srv
+from std_srvs.srv import Trigger
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
+import cv2
+import numpy as np
+from clover import long_callback
+
+# Initialize
+rospy.init_node('gate_detector')
+bridge = CvBridge()
+image_pub = rospy.Publisher('~center_gate', Image, queue_size=1)
+
+# Services
+get_telemetry = rospy.ServiceProxy('get_telemetry', srv.GetTelemetry)
+navigate = rospy.ServiceProxy('navigate', srv.Navigate)
+land = rospy.ServiceProxy('land', Trigger)
+
+# Constants
+ALTITUDE = 1.9
+NAVIGATION_INTERVAL = 2.0  # seconds
+CENTER_X = 160
+CENTER_Y = 120
+TOLERANCE = 15
+
+# Globals
+last_nav_time = 0
+CenX = 0
+CenY = 0
+
+
+def navigate_wait(x=0, y=0, z=0, yaw=float('nan'), speed=0.5,
+                  frame_id='body', auto_arm=False, tolerance=0.2, timeout=10):
+    navigate(x=x, y=y, z=z, yaw=yaw, speed=speed,
+             frame_id=frame_id, auto_arm=auto_arm)
+    start = time.time()
+    while not rospy.is_shutdown():
+        telem = get_telemetry(frame_id='navigate_target')
+        if math.sqrt(telem.x ** 2 + telem.y ** 2 + telem.z ** 2) < tolerance:
+            break
+        if time.time() - start > timeout:
+            print("Timeout in navigate_wait()")
+            break
+        rospy.sleep(0.2)
+
+
+def should_navigate():
+    global last_nav_time
+    now = time.time()
+    if now - last_nav_time >= NAVIGATION_INTERVAL:
+        last_nav_time = now
+        return True
+    return False
+
+
+def navigate_gate(CenX):
+    # Determine if drone is centered
+    offset = CenX - CENTER_X
+    if abs(offset) < TOLERANCE:
+        print("Drone aligned with gate.")
+        return
+
+    # Move drone based on offset direction
+    if offset > 0:
+        CenXX = -0.6
+        print("Gate right → moving left")
+    else:
+        CenXX = 0.6
+        print("Gate left → moving right")
+
+    navigate_wait(x=CenXX, y=0, z=0, speed=0.3, auto_arm=False, frame_id='body')
+
+
+@long_callback
+def image_callback(msg):
+    global CenX, CenY
+
+    original_image = bridge.imgmsg_to_cv2(msg, 'bgr8')
+    gray = cv2.cvtColor(original_image, cv2.COLOR_BGR2GRAY)
+
+    # Threshold mask
+    mask = cv2.inRange(gray, 100, 120)
+    blurred = cv2.GaussianBlur(mask, (5, 5), 0)
+    contours, _ = cv2.findContours(
+        blurred, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+    if contours:
+        max_contour = max(contours, key=cv2.contourArea)
+        x, y, w, h = cv2.boundingRect(max_contour)
+        CenX = x + w // 2
+        CenY = y + h // 2
+
+        # Draw on frame
+        cv2.rectangle(original_image, (x, y),
+                      (x + w, y + h), (0, 255, 0), 2)
+        cv2.circle(original_image, (CenX, CenY), 3, (255, 255, 0), -1)
+        cv2.circle(original_image, (CENTER_X, CENTER_Y),
+                   50, (0, 0, 255), 1)  # center guide
+
+        cv2.putText(original_image, f"X:{CenX}, Y:{CenY}", (x, y - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 2)
+
+        if should_navigate():
+            navigate_gate(CenX)
+
+    image_pub.publish(bridge.cv2_to_imgmsg(original_image, 'bgr8'))
+
+
+# Take off
+print("Taking off...")
+navigate_wait(x=0, y=0, z=ALTITUDE, speed=0.3,
+              auto_arm=True, frame_id='body')
+rospy.sleep(1)
+
+# Move forward
+print("Moving forward...")
+navigate_wait(x=2, y=0, z=0, speed=0.3, auto_arm=False, frame_id='body')
+rospy.sleep(1)
+
+# Start processing camera
+image_sub = rospy.Subscriber(
+    'main_camera/image_raw', Image, image_callback, queue_size=1)
+
+rospy.spin()
