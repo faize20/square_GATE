@@ -1,0 +1,169 @@
+# Information: https://clover.coex.tech/camera
+
+# Example on basic working with the camera and image processing:
+
+# - cuts out a central square from the camera image;
+# - publishes this cropped image to the topic `/cv/center`;
+# - computes the average color of it;
+# - prints its name to the console.
+
+import rospy
+import time
+import math
+
+from clover import srv
+from std_srvs.srv import Trigger
+from std_msgs.msg import Float64MultiArray
+from sensor_msgs.msg import Range
+from sensor_msgs.msg import Image
+from clover import srv
+from std_srvs.srv import Trigger
+from geometry_msgs.msg import TwistStamped
+from sensor_msgs.msg import Image
+from pyzbar import pyzbar
+from cv_bridge import CvBridge
+import cv2
+import numpy as np
+from clover import long_callback
+
+#VARIABLE
+CenX = 0
+CenY = 0
+
+#VARIABLE LAIN
+size = width, height = 320, 240
+center = width // 2, ((height // 2))
+
+rospy.init_node('square_camera')
+bridge = CvBridge()
+
+image_pub = rospy.Publisher('~center_gate', Image, queue_size=1)
+
+get_telemetry = rospy.ServiceProxy('get_telemetry', srv.GetTelemetry)
+navigate = rospy.ServiceProxy('navigate', srv.Navigate)
+navigate_global = rospy.ServiceProxy('navigate_global', srv.NavigateGlobal)
+set_position = rospy.ServiceProxy('set_position', srv.SetPosition)
+set_velocity = rospy.ServiceProxy('set_velocity', srv.SetVelocity)
+set_attitude = rospy.ServiceProxy('set_attitude', srv.SetAttitude)
+set_rates = rospy.ServiceProxy('set_rates', srv.SetRates)
+land = rospy.ServiceProxy('land', Trigger)
+
+
+#ALT PID SETTINGS
+altT = 1.9
+
+last_action_time = time.time()
+
+#Standard X,Y,ZNavigation
+def navigate_wait(x=0, y=0, z=0, yaw=float('nan'), speed=0.5, frame_id='body', auto_arm=False, tolerance=0.2):
+    navigate(x=x, y=y, z=z, yaw=yaw, speed=speed, frame_id=frame_id, auto_arm=auto_arm)
+
+    while not rospy.is_shutdown():
+        telem = get_telemetry(frame_id='navigate_target')
+        if math.sqrt(telem.x ** 2 + telem.y ** 2 + telem.z ** 2) < tolerance:
+            break
+        rospy.sleep(0.2)
+
+#GATE ALGORYTHM
+def navigate_gate():
+    global CenX, CenY
+
+    # Default values (e.g., don't move if centered)
+    xVel = 0.0
+    yVel = 0.0
+    
+
+    #gate correction X (forward-backward / up-down)
+    if CenX > 210:
+        xVel = -0.2
+        print("red")
+    elif CenX < 110:
+        xVel = 0.2
+        print("blue")
+
+    #gate correction Y (left-right)
+    if CenY > 170:
+        yVel = -0.2
+        print("red")
+    elif CenY < 70:
+        yVel = 0.2
+        print("blue")
+
+    # Stop condition (drone centered on gate)
+    if 110 <= CenX <= 210 and 70 <= CenY <= 170:
+        xVel = yVel = 0.0
+        print("Centered. Holding position.")
+
+    #SEND COMMAND TO TO DRONE - ADJUST NAVIGATION
+    set_velocity(vx=xVel, vy=yVel, auto_arm=True, frame_id='body')
+    
+
+@long_callback
+def image_callback(msg):
+    global CenX, CenY, last_action_time
+    original_image = bridge.imgmsg_to_cv2(msg, 'bgr8')
+
+    #cv_image = bridge.imgmsg_to_cv2(original_image, 'mono8')  # OpenCV image
+    cv_image = cv2.cvtColor(original_image, cv2.COLOR_BGR2GRAY)
+
+    output_frame = cv_image
+    lower_mask_value = 100 #white sensitivity 170w #square20 #40 for Black Line #170 for White Line
+    higher_mask_value = 120
+
+    #Thresholding
+    mask = cv2.inRange(output_frame, lower_mask_value, higher_mask_value)
+
+    #Finding Contours
+    
+    blurred = cv2.GaussianBlur(mask, (5, 5), 0)
+    #value, imgThres = cv2.threshold(blurred, 60, 255, cv2.THRESH_BINARY_INV)
+
+    contours, hierarchy = cv2.findContours(blurred, cv2.RETR_TREE, cv2.CHAIN_APPROX_SIMPLE)
+
+    if len(contours) != 0:
+        # Get the largest contour
+        max_contour = max(contours, key=cv2.contourArea)
+        
+        # Get the bounding rectangle
+        x, y, w, h = cv2.boundingRect(max_contour)
+        CenX = x + w // 2
+        CenY = y + h // 2
+        obj_center = (CenX, CenY)
+        frame_center = (160, 120)
+
+        # Draw the bounding rectangle on the frame
+        cv2.rectangle(original_image, (x, y), (x + w, y + h), (0, 255, 0), 2)
+        cv2.circle(original_image, obj_center, 2, (0, 255, 255), -1)  # yellow circle
+        cv2.circle(original_image, frame_center, 100, (0, 0, 255), 1)  # red circle
+        cv2.putText(original_image, f"CenX:{CenX}, CenY:{CenY}", (x, y - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+        #if time.time() - last_action_time > 2.0:  # wait 2 seconds between actions
+        navigate_gate()
+                #last_action_time = time.time()
+
+    image_pub.publish(bridge.cv2_to_imgmsg(original_image, 'bgr8'))
+    print(CenX, CenY)
+
+        
+
+
+
+
+#TAKEOFF HERE (Speed Ori: 0.75)
+print ('Taking Off..')
+navigate_wait(x=0, y=0, z=altT, speed=0.3, auto_arm=True, frame_id='body')
+rospy.sleep(0.8)
+print ('forward 2m..')
+navigate_wait(x=2, y=0, z=0, speed=0.3, auto_arm=True, frame_id='body')
+
+
+# Wait for 2 seconds
+rospy.sleep(2)
+
+# process every frame:
+image_sub = rospy.Subscriber('main_camera/image_raw', Image, image_callback, queue_size=1)
+
+# process 5 frames per second:
+# image_sub = rospy.Subscriber('main_camera/image_raw_throttled', Image, image_callback, queue_size=1)
+
+rospy.spin()
